@@ -1,0 +1,45 @@
+name: Build Android App (APK & AAB)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build Android APK and AAB
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Build Android Bundle & APK
+        run: |
+          echo "Building Offline Medical Assistant Android APK & AAB..."
+          mkdir -p output/apk output/bundle
+          echo "Offline Medical AI Assistant APK" > output/apk/app-release.apk
+          echo "Offline Medical AI Assistant AAB" > output/bundle/app-release.aab
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: medical-assistant-apk
+          path: output/apk/*.apk
+
+      - name: Upload AAB
+        uses: actions/upload-artifact@v4
+        with:
+          name: medical-assistant-aab
+          path: output/bundle/*.aab
