@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+tests/temp_test_assets/
+assets/dist/
+build/
+dist/
+*.spec
+.env
+.venv
+env/
+venv/

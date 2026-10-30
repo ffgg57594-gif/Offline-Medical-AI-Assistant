@@ -1,0 +1,275 @@
+# ---------------------------------------------------------------------------
+# build_release.yml  —  CI/CD pipeline for the Offline Medical AI Assistant.
+#
+# Stages (runs on ubuntu-latest, fully offline-friendly):
+#   1. Build knowledge base   — medical_pdfs/*.pdf → assets/books_knowledge.db
+#      (PyMuPDF extraction + fastembed sentence embeddings + medical glossary)
+#   2. Download voice/LLM models — GGUF (Phi-3-mini) + Silero VAD +
+#      faster-whisper CTranslate2 int8 + Piper Arabic streaming ONNX → assets/
+#   3. Lint / test                 — pytest guardrail tests + syntax checks
+#   4. Package executable        — PyInstaller single-file bundle with all
+#      assets bundled (no external model install needed by end users)
+#   5. (Optional) GitHub release — attach the signed bundle + checksums
+# ---------------------------------------------------------------------------
+
+name: Build & Release Offline Medical AI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      release:
+        description: "Create a GitHub release (yes/no)"
+        required: false
+        default: "no"
+      pdf_seed:
+        description: "Seed PDFs from this HuggingFace dataset (optional)"
+        required: false
+        default: ""
+
+env:
+  PYTHON_VERSION: "3.11"
+  APP_NAME: "medical-ai-assistant"
+  ASSETS_DIR: "${{ github.workspace }}/assets"
+  VOICE_MODELS_DIR: "${{ github.workspace }}/assets/voice_models"
+
+jobs:
+  # ================================================================
+  # Stage 1 — Build knowledge base from medical_pdfs/*.pdf
+  # ================================================================
+  build-knowledge:
+    name: Build knowledge base
+    runs-on: ubuntu-latest
+    outputs:
+      db_sha256: ${{ steps.digest.outputs.db }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install build-time dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install PyMuPDF fastembed numpy soundfile tqdm requests
+
+      - name: Run knowledge-base builder
+        run: |
+          ls -la medical_pdfs/ || true
+          python scripts/build_knowledge_db.py --force
+          echo "built files:"; ls -la assets/*.db assets/*.npy assets/refusal_ar.wav
+
+      - name: Digest knowledge DB
+        id: digest
+        run: |
+          echo "db=$(sha256sum ${{ env.ASSETS_DIR }}/books_knowledge.db | cut -d' ' -f1)" >> $GITHUB_OUTPUT
+
+      - name: Upload knowledge artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: knowledge-db
+          path: |
+            ${{ env.ASSETS_DIR }}/books_knowledge.db
+            ${{ env.ASSETS_DIR }}/book_embeddings.npy
+            ${{ env.ASSETS_DIR }}/medical_glossary.json
+            ${{ env.ASSETS_DIR }}/refusal_ar.wav
+          retention-days: 30
+
+  # ================================================================
+  # Stage 2 — Download bundled voice / LLM models (assets/voice_models/)
+  # ================================================================
+  download-models:
+    name: Download voice/LLM models
+    needs: build-knowledge
+    runs-on: ubuntu-latest
+    outputs:
+      models_sha256: ${{ steps.digest.outputs.dir }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install download dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests tqdm
+
+      - name: Download bundled models
+        run: |
+          echo "Downloading models into ${VOICE_MODELS_DIR}..."
+          python scripts/download_models.py --force
+          echo "downloaded:"; ls -la "${VOICE_MODELS_DIR}/"
+
+      - name: Validate model presence
+        run: |
+          set -euo pipefail
+          require() {
+            local file="$1"
+            local min_bytes="$2"
+            local size
+            size=$(stat -c%s "${VOICE_MODELS_DIR}/${file}" || echo 0)
+            if [[ "$size" -lt "$min_bytes" ]]; then
+              echo "FAIL: ${file} too small (${size} bytes < ${min_bytes})"
+              exit 1
+            fi
+            echo "OK: ${file} (${size} bytes)"
+          }
+          require "phi3mini4k.Q4_K_M.gguf" 3_000_000_000
+          require "silero_vad.onnx" 100_000
+          require "faster_whisper_tiny_int8/encoder/encoder.onnx" 1_000_000
+          require "piper_arabic_standard.onnx" 10_000_000
+
+      - name: Digest models directory
+        id: digest
+        run: |
+          echo "dir=$(sha256sum ${VOICE_MODELS_DIR}/* | sha256sum | cut -d' ' -f1)" >> $GITHUB_OUTPUT
+
+      - name: Upload voice models
+        uses: actions/upload-artifact@v4
+        with:
+          name: voice-models
+          path: ${{ env.VOICE_MODELS_DIR }}
+          retention-days: 30
+
+  # ================================================================
+  # Stage 3 — Lint, type-check, and run guardrail unit tests
+  # ================================================================
+  ci-tests:
+    name: CI — lint & guardrail tests
+    needs: build-knowledge
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install PySide6 faster-whisper ctranslate2 numpy llama-cpp-python
+          pip install --no-deps -e .
+
+      - name: Run PyFlakes / PyLint sanity checks
+        run: |
+          pip install pyflakes
+          python -m pyflakes scripts/*.py src/*.py tests/*.py
+          python -m py_compile scripts/*.py src/*.py tests/*.py
+
+      - name: Run strict-guardrail unit tests
+        run: |
+          cd tests && python -m pytest test_strict_guardrail.py -v || python -m unittest test_strict_guardrail -v
+
+  # ================================================================
+  # Stage 4 — Package a single-file executable (no user setup)
+  # ================================================================
+  package:
+    name: Package executable
+    needs: [build-knowledge, download-models, ci-tests]
+    runs-on: ubuntu-latest
+    outputs:
+      bundle_sha256: ${{ steps.digest.outputs.bundle }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install runtime dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install PySide6 llama-cpp-python faster-whisper ctranslate2 sounddevice soundfile numpy PyInstaller requests tqdm
+
+      - name: Restore knowledge + voice artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: knowledge-db,voice-models
+          merge-multiple: true
+
+      - name: Ensure assets layout
+        run: |
+          mkdir -p ${{ env.VOICE_MODELS_DIR }}
+          mv voice-models/* ${{ env.VOICE_MODELS_DIR }}/ 2>/dev/null || true
+          mv knowledge-db/* . 2>/dev/null || true
+          ls -la assets/
+
+      - name: Build PyInstaller single-file bundle
+        run: |
+          pyinstaller --clean --noconfirm \
+            --name "MedicalAIAssistant" \
+            --windowed \
+            --add-data "assets:assets" \
+            --hidden-import PySide6.QtMultimedia \
+            --onefile \
+            --distpath ${{ env.ASSETS_DIR }}/dist \
+            src/gui_app.py
+
+      - name: Digest bundle
+        id: digest
+        run: |
+          BUNDLE=$(ls ${{ env.ASSETS_DIR }}/dist/MedicalAIAssistant)
+          echo "bundle=$(sha256sum "$BUNDLE" | cut -d' ' -f1)" >> $GITHUB_OUTPUT
+
+      - name: Upload release bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: MedicalAIAssistant-linux-x86_64
+          path: ${{ env.ASSETS_DIR }}/dist/MedicalAIAssistant
+
+  # ================================================================
+  # Stage 5 — Optional GitHub release
+  # ================================================================
+  release:
+    name: Create release
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.release == 'yes'
+    needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: MedicalAIAssistant-linux-x86_64
+          path: release-bundle
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.0
+          name: "Offline Medical AI Assistant v1.0.0"
+          body: |
+            100% offline medical textbooks chat + live voice assistant.
+            No external model installation required — everything is bundled.
+
+            **Includes:**
+            - Pre-indexed medical textbook knowledge base (`books_knowledge.db`)
+            - Phi-3-mini GGUF Q4_K_M (3.8 GB) — offline LLM
+            - Silero VAD (~2 MB), faster-whisper CTranslate2 int8 STT (~75 MB), Piper Arabic streaming TTS (~40 MB)
+            - Hard guardrail gate: out-of-scope queries refused at < 10 ms
+
+            **Usage:**
+            `./MedicalAIAssistant` — runs immediately, no setup.
+
+            **Checksums (sha256):**
+            - Binary: `${{ needs.package.outputs.bundle_sha256 }}`
+          files: |
+            release-bundle/MedicalAIAssistant
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

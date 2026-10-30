@@ -1,0 +1,24 @@
+# --- Core ML / Inference ---
+llama-cpp-python>=0.2.88
+faster-whisper>=1.0.0
+ctranslate2>=4.3.0
+sherpa-onnx>=1.10.48
+piper-tts @ git+https://github.com/rhasspy/piper.git@v1.3.0
+silero-vad @ git+https://github.com/snakers4/silero-vad.git@v5.0
+onnxruntime>=1.17.0
+fastembed>=0.3.0
+numpy>=1.26.0,<2.0.0
+PyMuPDF>=1.24.0
+
+# --- GUI ---
+PySide6>=6.6.0
+sounddevice>=0.4.6
+soundfile>=0.12.0
+scipy>=1.11.0
+
+# --- Packaging ---
+pyinstaller>=6.3.0
+
+# --- Utilities ---
+requests>=2.31.0
+tqdm>=4.66.0
